@@ -662,11 +662,14 @@
 
     <!-- Supabase Client Initialization -->
     <script>
-        const SUPABASE_URL = 'https://dzuycbqcltmlrktiszby.supabase.co';
-        const SUPABASE_ANON_KEY = 'sb_publishable_t89DAWTsAEzM5VrdUfdMlg_WPuvUTx6';
-        const supabase = (typeof window.supabase !== 'undefined' && window.supabase.createClient)
-            ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
-            : null;
+        (function() {
+            const SUPABASE_URL = 'https://dzuycbqcltmlrktiszby.supabase.co';
+            const SUPABASE_ANON_KEY = 'sb_publishable_t89DAWTsAEzM5VrdUfdMlg_WPuvUTx6';
+            if (window.supabase && typeof window.supabase.createClient === 'function') {
+                window.supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+                window.supabase = window.supabaseClient;
+            }
+        })();
     </script>
 
     <!-- Scripts -->

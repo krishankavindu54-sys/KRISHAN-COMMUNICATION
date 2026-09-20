@@ -17,9 +17,9 @@ CREATE TABLE IF NOT EXISTS users (
 -- Default Admin & Cashier Accounts (Pass: admin123, cashier123)
 INSERT INTO users (username, password_hash, name, role)
 VALUES 
-    ('admin', '$2b$10$wTkyrQ6R09uCq1pS6E7mE.s2D9/V5sE2R1m2K.0Yt8ZqN9WvX1Y2C', 'Administrator', 'admin'),
-    ('cashier', '$2b$10$wTkyrQ6R09uCq1pS6E7mE.s2D9/V5sE2R1m2K.0Yt8ZqN9WvX1Y2C', 'Cashier', 'cashier')
-ON CONFLICT (username) DO NOTHING;
+    ('admin', '$2a$10$l/McfkfF46qdC/2SXhyROOhtez.8VL/nQ6.X10WajmX3uThvm8XUK', 'Administrator', 'admin'),
+    ('cashier', '$2a$10$xay82r0bbWzr3SWeTv/dWO4KdQh5F1STdKuSqWIcMrJY0VPnHXGUe', 'Cashier', 'cashier')
+ON CONFLICT (username) DO UPDATE SET password_hash = EXCLUDED.password_hash;
 
 -- 2. ITEMS / INVENTORY TABLE
 CREATE TABLE IF NOT EXISTS items (
