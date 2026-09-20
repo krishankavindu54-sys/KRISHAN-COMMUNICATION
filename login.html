@@ -22,8 +22,6 @@
 
     <!-- SweetAlert2 -->
     <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
-    <script
-        src="[https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2](https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2)"></script>
 
     <style>
         body {
@@ -170,6 +168,18 @@
         </p>
     </div>
 
+    <!-- 1. Supabase CDN Script -->
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+
+    <!-- 2. Supabase Client Initialization -->
+    <script>
+        const supabase = window.supabase.createClient(
+            'https://dzuycbqcltmlrktiszby.supabase.co',
+            'sb_publishable_t89DAWTsAEzM5VrdUfdMlg_WPuvUTx6'
+        );
+    </script>
+
+    <!-- 3. Authentication Script -->
     <script>
         function getApiBase() {
             const saved = localStorage.getItem('krishan_pos_custom_server_url');
@@ -332,11 +342,7 @@
                 }
             }
         })();
-
     </script>
-    <script
-        src="[https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2](https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2)"></script>
-    <script>const supabase = supabase.createClient('https://dzuycbqcltmlrktiszby.supabase.co/rest/v1/', 'sb_publishable_t89DAWTsAEzM5VrdUfdMlg_WPuvUTx6');</script>
 </body>
 
 </html>

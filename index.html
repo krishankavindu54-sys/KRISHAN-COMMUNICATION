@@ -42,8 +42,7 @@
             document.write('<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"><\/script>');
         }
     </script>
-    <script
-        src="[https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2](https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2)"></script>
+
     <style>
         body {
             font-family: 'Outfit', sans-serif;
@@ -694,11 +693,19 @@
         </div>
     </div>
 
-    <!-- Scripts -->
+    <!-- 1. Supabase CDN Script (Telah dibersihkan dari sintaks markdown) -->
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+
+    <!-- 2. Supabase Initialization (URL tanpa /rest/v1/) -->
+    <script>
+        const supabase = window.supabase.createClient(
+            'https://dzuycbqcltmlrktiszby.supabase.co',
+            'sb_publishable_t89DAWTsAEzM5VrdUfdMlg_WPuvUTx6'
+        );
+    </script>
+
+    <!-- 3. Memuat app.js setelah Supabase siap -->
     <script src="app.js"></script>
-    <script
-        src="[https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2](https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2)"></script>
-    <script>const supabase = supabase.createClient('https://dzuycbqcltmlrktiszby.supabase.co/rest/v1/', 'sb_publishable_t89DAWTsAEzM5VrdUfdMlg_WPuvUTx6');</script>
 </body>
 
 </html>
