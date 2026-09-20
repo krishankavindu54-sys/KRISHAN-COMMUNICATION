@@ -6,8 +6,12 @@ require('dotenv').config();
 // ──────────────────────────────────────────────
 // SUPABASE CLOUD DATABASE CONFIGURATION (100% Free Cloud DB)
 // ──────────────────────────────────────────────
-const SUPABASE_URL = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL;
-const SUPABASE_KEY = process.env.SUPABASE_KEY || process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY;
+let rawSupabaseUrl = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || 'https://dzuycbqcltmlrktiszby.supabase.co';
+if (rawSupabaseUrl) {
+    rawSupabaseUrl = rawSupabaseUrl.replace(/\/rest\/v1\/?$/, '').replace(/\/+$/, '');
+}
+const SUPABASE_URL = rawSupabaseUrl;
+const SUPABASE_KEY = process.env.SUPABASE_KEY || process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY || 'sb_publishable_t89DAWTsAEzM5VrdUfdMlg_WPuvUTx6';
 
 let supabase = null;
 if (SUPABASE_URL && SUPABASE_KEY) {

@@ -1,13 +1,18 @@
+
 // Database Initialization
 const db = new Dexie('KrishanPOS_DB');
 db.version(1).stores({
-    items: '++id, name, barcode, category, type',
+    items: '++id, name, barcode, category, type', // type: 'product' | 'service'
     repairs: '++id, customerName, phoneModel, status, createdAt',
-    sales: '++id, date, total, paymentMethod',
+    sales: '++id, date, total, paymentMethod', // date is ISO string
     expenses: '++id, date, category',
-    creditors: '++id, name, amount, lastUpdated, type'
+    creditors: '++id, name, amount, lastUpdated, type' // type: 'payable' | 'receivable'
 });
 
+// Update for versioning if needed - strictly keeping v1 for simplicity unless migration needed.
+// Dexie handles schema changes dynamically often, but best practice is versioning.
+// Since we are adding a store, we can just add it to the existing definition if the DB hasn't been blocked.
+// However, the cleanest way for a running app is to bump version.
 db.version(2).stores({
     items: '++id, name, barcode, category, type',
     repairs: '++id, customerName, phoneModel, status, createdAt',
@@ -28,104 +33,238 @@ db.version(5).stores({
     purchaseBills: '++id, supplierId, date, status'
 });
 
-// App Engine & Logic
+// Seed initial data if empty
+db.on('populate', () => {
+    db.items.bulkAdd([
+        { name: "Photocopy (A4)", category: "Service", type: "service", price: 10, cost: 2, barcode: "SERV001", stock: 0 },
+        { name: "Passport Photo", category: "Studio", type: "service", price: 350, cost: 50, barcode: "SERV002", stock: 0 },
+        { name: "Tempered Glass", category: "Accessories", type: "product", price: 500, cost: 150, barcode: "ACC001", stock: 20, minStock: 5 },
+        { name: "CR Books", category: "Stationery", type: "product", price: 250, cost: 180, barcode: "STAT001", stock: 50, minStock: 10 }
+    ]);
+});
+
+// App Logic
 const app = {
     state: {
         cart: [],
         currentView: 'dashboard',
-        posCategory: null,
+        posCategory: null, // null means "Category Selection Mode"
         inventoryCategory: 'All',
-        lastAddedCategory: 'General',
-        scanner: null,
-        modalScanner: null,
-        selectedCreditor: null
+        lastAddedCategory: 'General', // Default for new items
+        scanner: null, // Global scanner instance
+        modalScanner: null, // Item Modal scanner instance
+        selectedCreditor: null // For POS credit sales
+    },
+
+    getServerUrl: () => {
+        const saved = localStorage.getItem('krishan_pos_custom_server_url');
+        if (saved && saved.trim()) {
+            return saved.trim().replace(/\/+$/, '');
+        }
+        if (window.location.protocol === 'file:' || (window.location.port !== '3000' && (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'))) {
+            return 'http://localhost:3000';
+        }
+        if (window.location.hostname.endsWith('github.io')) {
+            return saved ? saved.trim().replace(/\/+$/, '') : '';
+        }
+        return window.location.origin;
+    },
+
+    getApiUrl: (path) => {
+        const serverUrl = app.getServerUrl();
+        const cleanPath = path.startsWith('/') ? path : '/' + path;
+        if (serverUrl) {
+            return `${serverUrl}${cleanPath}`;
+        }
+        return cleanPath;
+    },
+
+    getAuthHeaders: (customHeaders = {}) => {
+        const headers = { 'Content-Type': 'application/json', ...customHeaders };
+        const token = localStorage.getItem('pos_token');
+        if (token) {
+            headers['Authorization'] = `Bearer ${token}`;
+        }
+        const socketId = app.realtime?.getSocketId?.();
+        if (socketId) {
+            headers['x-socket-id'] = socketId;
+        }
+        return headers;
     },
 
     currentUser: null,
 
-    // Supabase Direct Database Bridge
-    apiCall: async (tableOrPath, method = 'GET', data = null) => {
-        if (typeof supabase === 'undefined') {
-            console.warn('Supabase client is not initialized.');
-            return null;
-        }
-
-        const tableName = tableOrPath.replace(/^\/?api\//, '').split('/')[0];
-
-        try {
-            if (method === 'GET') {
-                const { data: resData, error } = await supabase.from(tableName).select('*');
-                if (error) throw error;
-                return resData;
-            } else if (method === 'POST') {
-                const { data: resData, error } = await supabase.from(tableName).insert([data]).select();
-                if (error) throw error;
-                return resData ? resData[0] : null;
-            } else if (method === 'PUT') {
-                const id = data.id;
-                const updateData = { ...data };
-                delete updateData.id;
-                const { data: resData, error } = await supabase.from(tableName).update(updateData).eq('id', id).select();
-                if (error) throw error;
-                return resData ? resData[0] : null;
-            } else if (method === 'DELETE') {
-                const id = tableOrPath.split('/').pop();
-                const { error } = await supabase.from(tableName).delete().eq('id', id);
-                if (error) throw error;
-                return { success: true };
-            }
-        } catch (err) {
-            console.warn(`Supabase call failed for ${tableName}:`, err.message);
-            return null;
-        }
-    },
-
+    // Realtime Multi-Device Sync Engine (Socket.io + HTTP Polling Fallback + IndexedDB)
     realtime: {
         socket: null,
-        status: 'connected',
-        syncMode: 'supabase',
+        status: 'connecting', // 'connected' | 'syncing' | 'offline'
+        syncMode: 'websocket', // 'websocket' | 'polling'
         deviceCount: 1,
         lastSyncTime: null,
-        pendingQueue: [],
+        pendingQueue: JSON.parse(localStorage.getItem('pos_offline_queue') || '[]'),
+        pollingInterval: null,
+        keepAliveInterval: null,
 
         init: () => {
-            app.realtime.setStatus('connected');
-            app.syncWithBackend(false);
-            app.realtime.startPollingFallback();
+            app.realtime.startKeepAlive();
+            const serverUrl = app.getServerUrl();
+            const isVercel = window.location.hostname.includes('vercel.app');
+            const isGitHubPages = window.location.hostname.endsWith('github.io');
+
+            // On Vercel (Serverless REST cloud), start Cloud REST Polling Sync immediately
+            if (isVercel || (!serverUrl && isGitHubPages)) {
+                console.log('⚡ [Realtime] Initializing Cloud REST Sync Engine for Vercel/Cloud...');
+                app.realtime.syncMode = 'polling';
+                app.realtime.setStatus('connected');
+                app.realtime.startPollingFallback();
+                app.syncWithBackend(false);
+                return;
+            }
+
+            try {
+                if (typeof io === 'undefined') {
+                    console.warn('Socket.io library not detected. Starting HTTP Cloud Polling fallback.');
+                    app.realtime.syncMode = 'polling';
+                    app.realtime.setStatus('connected');
+                    app.realtime.startPollingFallback();
+                    app.syncWithBackend(false);
+                    return;
+                }
+
+                const socketUrl = serverUrl || window.location.origin;
+
+                const socket = io(socketUrl, {
+                    reconnection: true,
+                    reconnectionAttempts: 5,
+                    reconnectionDelay: 2000,
+                    reconnectionDelayMax: 10000,
+                    timeout: 10000,
+                    transports: ['websocket', 'polling']
+                });
+
+                app.realtime.socket = socket;
+
+                socket.on('connect', () => {
+                    console.log('⚡ [Realtime] Connected to POS WebSocket, Socket ID:', socket.id);
+                    app.realtime.syncMode = 'websocket';
+                    app.realtime.setStatus('connected');
+                    app.realtime.flushOfflineQueue();
+                    app.syncWithBackend(false);
+                });
+
+                socket.on('disconnect', (reason) => {
+                    console.warn('🔌 [Realtime] WebSocket disconnected (switching to HTTP Cloud Polling):', reason);
+                    app.realtime.syncMode = 'polling';
+                    app.realtime.setStatus('connected');
+                    app.realtime.startPollingFallback();
+                });
+
+                socket.on('connect_error', (err) => {
+                    console.warn('⚠️ [Realtime] WebSocket connection issue (using HTTP Cloud Polling):', err?.message);
+                    app.realtime.syncMode = 'polling';
+                    app.realtime.setStatus('connected');
+                    app.realtime.startPollingFallback();
+                });
+
+                socket.on('sync:welcome', (data) => {
+                    if (data && data.deviceCount !== undefined) {
+                        app.realtime.deviceCount = data.deviceCount;
+                        app.realtime.updateStatusUI();
+                    }
+                });
+
+                socket.on('sync:device_count', (data) => {
+                    if (data && data.count !== undefined) {
+                        app.realtime.deviceCount = data.count;
+                        app.realtime.updateStatusUI();
+                    }
+                });
+
+                socket.on('sync:event', (event) => {
+                    app.realtime.handleIncomingEvent(event);
+                });
+
+            } catch (err) {
+                console.error('Socket init error:', err);
+                app.realtime.syncMode = 'polling';
+                app.realtime.setStatus('connected');
+                app.realtime.startPollingFallback();
+            }
         },
 
-        startKeepAlive: () => { },
-
-        startPollingFallback: () => {
-            setInterval(async () => {
-                if (typeof supabase === 'undefined') return;
+        // Cloud Keep-Alive: Sends ping every 25 seconds to prevent free cloud instances (Render/Vercel) from sleeping
+        startKeepAlive: () => {
+            if (app.realtime.keepAliveInterval) clearInterval(app.realtime.keepAliveInterval);
+            app.realtime.keepAliveInterval = setInterval(async () => {
+                const targetUrl = app.getApiUrl('/api/auth/me');
                 try {
-                    const { data: serverItems } = await supabase.from('items').select('*');
-                    if (Array.isArray(serverItems) && serverItems.length > 0) {
-                        let hasChanges = false;
-                        const localItems = await db.items.toArray();
-                        const localMap = new Map(localItems.map(i => [i.id, i]));
+                    await fetch(targetUrl, { method: 'GET', headers: app.getAuthHeaders(), credentials: 'include' });
+                } catch (e) {
+                    // Ignore background ping errors
+                }
+            }, 25000);
+        },
 
-                        for (const sItem of serverItems) {
-                            const lItem = localMap.get(sItem.id);
-                            if (!lItem || lItem.stock !== sItem.stock || lItem.price !== sItem.price || lItem.name !== sItem.name) {
-                                await db.items.put(sItem);
-                                hasChanges = true;
+        // HTTP Cloud Polling Fallback (ensures Vercel Serverless / Free Cloud stays 100% Live with realtime stock sync)
+        startPollingFallback: () => {
+            if (app.realtime.pollingInterval) return; // Already polling
+
+            console.log('🔄 [Realtime] Started HTTP Cloud Polling & Stock Sync fallback...');
+            let isSyncing = false;
+
+            const executePoll = async () => {
+                if (isSyncing) return;
+                isSyncing = true;
+                try {
+                    const targetUrl = app.getApiUrl('/api/items');
+                    const res = await fetch(targetUrl, { method: 'GET', headers: app.getAuthHeaders(), credentials: 'include' });
+                    if (res.ok) {
+                        const serverItems = await res.json();
+                        if (Array.isArray(serverItems)) {
+                            let hasChanges = false;
+                            const localItems = await db.items.toArray();
+                            const localMap = new Map(localItems.map(i => [i.id, i]));
+
+                            for (const sItem of serverItems) {
+                                const lItem = localMap.get(sItem.id);
+                                if (!lItem || lItem.stock !== sItem.stock || lItem.price !== sItem.price || lItem.name !== sItem.name) {
+                                    await db.items.put(sItem);
+                                    hasChanges = true;
+                                }
+                            }
+
+                            // If stock or items changed, immediately update UI without disrupting inputs
+                            if (hasChanges) {
+                                console.log('⚡ [Cloud Stock Sync] Live stock change synced from cloud, updating view...');
+                                if (app.state.currentView === 'pos') app.renderPOS();
+                                if (app.state.currentView === 'products') app.renderInventory();
+                                if (app.state.currentView === 'dashboard') app.renderDashboard();
+                            }
+
+                            app.realtime.syncMode = 'polling';
+                            app.realtime.setStatus('connected');
+                            app.realtime.lastSyncTime = new Date();
+
+                            // Also flush offline queue if any
+                            if (app.realtime.pendingQueue.length > 0) {
+                                await app.realtime.flushOfflineQueue();
                             }
                         }
-
-                        if (hasChanges) {
-                            if (app.state.currentView === 'pos' && typeof app.renderPOS === 'function') app.renderPOS();
-                            if (app.state.currentView === 'products' && typeof app.renderInventory === 'function') app.renderInventory();
-                            if (app.state.currentView === 'dashboard' && typeof app.renderDashboard === 'function') app.renderDashboard();
-                        }
+                    } else if (res.status === 401) {
+                        // Backend is active and responded
+                        app.realtime.syncMode = 'polling';
+                        app.realtime.setStatus('connected');
                     }
-                    app.realtime.lastSyncTime = new Date();
-                    app.realtime.updateStatusUI();
-                } catch (e) {
-                    console.warn('Sync poll check:', e?.message);
+                } catch (err) {
+                    console.warn('Polling check:', err?.message);
+                } finally {
+                    isSyncing = false;
                 }
-            }, 5000);
+            };
+
+            // Run first poll immediately
+            executePoll();
+            app.realtime.pollingInterval = setInterval(executePoll, 2500);
         },
 
         setStatus: (status) => {
@@ -142,112 +281,765 @@ const app = {
 
             if (!widget) return;
 
-            widget.className = 'flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800 text-emerald-700 dark:text-emerald-300 text-xs font-bold cursor-pointer transition-all hover:scale-105 shadow-sm';
-            if (pulse) pulse.className = 'animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75';
-            if (dot) dot.className = 'relative inline-flex rounded-full h-2 w-2 bg-emerald-500';
-            if (text) text.textContent = 'Cloud Live';
-            if (badge) {
-                badge.textContent = 'Supabase';
-                badge.className = 'px-1.5 py-0.2 rounded-full bg-emerald-200/60 dark:bg-emerald-800/60 text-[10px]';
+            const count = app.realtime.deviceCount || 1;
+            const mode = app.realtime.syncMode || 'websocket';
+
+            if (app.realtime.status === 'connected') {
+                widget.className = 'flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800 text-emerald-700 dark:text-emerald-300 text-xs font-bold cursor-pointer transition-all hover:scale-105 shadow-sm';
+                if (pulse) pulse.className = 'animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75';
+                if (dot) dot.className = 'relative inline-flex rounded-full h-2 w-2 bg-emerald-500';
+                if (text) text.textContent = mode === 'polling' ? 'Cloud Live' : 'Live';
+                if (badge) {
+                    badge.textContent = mode === 'polling' ? 'Cloud Sync' : (count > 1 ? `${count} devices` : 'Live');
+                    badge.className = 'px-1.5 py-0.2 rounded-full bg-emerald-200/60 dark:bg-emerald-800/60 text-[10px]';
+                }
+                widget.title = `Realtime Live Sync Active (${mode === 'polling' ? 'HTTP Cloud Sync' : count + ' connected device(s)'}). Click for details.`;
+            } else if (app.realtime.status === 'syncing') {
+                widget.className = 'flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800 text-amber-700 dark:text-amber-300 text-xs font-bold cursor-pointer transition-all hover:scale-105 shadow-sm';
+                if (pulse) pulse.className = 'animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-75';
+                if (dot) dot.className = 'relative inline-flex rounded-full h-2 w-2 bg-amber-500';
+                if (text) text.textContent = 'Syncing...';
+                if (badge) {
+                    badge.textContent = '...';
+                    badge.className = 'px-1.5 py-0.2 rounded-full bg-amber-200/60 dark:bg-amber-800/60 text-[10px]';
+                }
+                widget.title = 'Synchronizing with server...';
+            } else {
+                // Offline
+                widget.className = 'flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800 text-rose-700 dark:text-rose-300 text-xs font-bold cursor-pointer transition-all hover:scale-105 shadow-sm';
+                if (pulse) pulse.className = 'hidden';
+                if (dot) dot.className = 'relative inline-flex rounded-full h-2 w-2 bg-rose-500';
+                if (text) text.textContent = 'Offline';
+                if (badge) {
+                    const qCount = app.realtime.pendingQueue.length;
+                    badge.textContent = qCount > 0 ? `${qCount} queued` : 'Local';
+                    badge.className = 'px-1.5 py-0.2 rounded-full bg-rose-200/60 dark:bg-rose-800/60 text-[10px]';
+                }
+                widget.title = 'Offline mode (Working locally). Click for diagnostics & Server URL setup.';
             }
         },
 
-        flushOfflineQueue: async () => { },
-        queueOfflineMutation: () => { }
+        getSocketId: () => {
+            return app.realtime.socket?.id || null;
+        },
+
+        queueOfflineMutation: (type, targetId, payload) => {
+            const op = {
+                id: 'op_' + Date.now() + '_' + Math.random().toString(36).substr(2, 5),
+                type,
+                targetId,
+                payload,
+                queuedAt: new Date().toISOString()
+            };
+            app.realtime.pendingQueue.push(op);
+            localStorage.setItem('pos_offline_queue', JSON.stringify(app.realtime.pendingQueue));
+            app.realtime.updateStatusUI();
+            console.log('📦 Queued offline action:', op);
+        },
+
+        flushOfflineQueue: async () => {
+            if (app.realtime.pendingQueue.length === 0) return;
+            console.log(`📤 Flushing ${app.realtime.pendingQueue.length} offline operations to server...`);
+            try {
+                const res = await fetch(app.getApiUrl('/api/sync/batch'), {
+                    method: 'POST',
+                    headers: app.getAuthHeaders(),
+                    credentials: 'include',
+                    body: JSON.stringify({ operations: app.realtime.pendingQueue })
+                });
+                if (res.ok) {
+                    const data = await res.json();
+                    if (data.success) {
+                        console.log('✅ Offline queue synced successfully:', data.processed);
+                        app.realtime.pendingQueue = [];
+                        localStorage.removeItem('pos_offline_queue');
+                        app.realtime.updateStatusUI();
+                        await app.syncWithBackend(false);
+                    }
+                }
+            } catch (err) {
+                console.warn('Could not flush offline queue:', err);
+            }
+        },
+
+        handleIncomingEvent: async (event) => {
+            if (!event || !event.type) return;
+            console.log('⚡ [Realtime Sync Event]:', event.type, event.data);
+            app.realtime.lastSyncTime = new Date();
+
+            try {
+                switch (event.type) {
+                    case 'ITEM_CREATED':
+                    case 'ITEM_UPDATED': {
+                        const item = event.data;
+                        if (item && item.id) {
+                            await db.items.put(item);
+                            if (app.state.currentView === 'pos') app.renderPOS();
+                            if (app.state.currentView === 'products') app.renderInventory();
+                            if (app.state.currentView === 'dashboard') app.renderDashboard();
+                        }
+                        break;
+                    }
+                    case 'ITEM_DELETED': {
+                        const { id } = event.data || {};
+                        if (id) {
+                            await db.items.delete(Number(id));
+                            if (app.state.currentView === 'pos') app.renderPOS();
+                            if (app.state.currentView === 'products') app.renderInventory();
+                            if (app.state.currentView === 'dashboard') app.renderDashboard();
+                        }
+                        break;
+                    }
+                    case 'STOCK_CHANGED': {
+                        const { id, stock } = event.data || {};
+                        if (id && stock !== undefined) {
+                            await db.items.update(Number(id), { stock: Number(stock) });
+                            if (app.state.currentView === 'pos') app.renderPOS();
+                            if (app.state.currentView === 'products') app.renderInventory();
+                        }
+                        break;
+                    }
+                    case 'SALE_CREATED': {
+                        const { sale, items, cashier } = event.data || {};
+                        if (sale) {
+                            await db.sales.put(sale);
+                            if (items && Array.isArray(items) && items.length > 0) {
+                                for (const it of items) {
+                                    await db.items.put(it);
+                                }
+                            }
+                            if (app.state.currentView === 'pos') app.renderPOS();
+                            if (app.state.currentView === 'sales') app.renderSalesHistory();
+                            if (app.state.currentView === 'dashboard') app.renderDashboard();
+                            if (app.state.currentView === 'reports') app.renderReports();
+                            if (app.state.currentView === 'credits') app.renderCredits();
+
+                            const cashierName = cashier ? ` (${cashier})` : '';
+                            Swal.fire({
+                                toast: true,
+                                position: 'top-end',
+                                icon: 'info',
+                                title: `🛒 New Sale: LKR ${Number(sale.total).toFixed(2)}${cashierName}`,
+                                timer: 2500,
+                                showConfirmButton: false
+                            });
+                        }
+                        break;
+                    }
+                    case 'SALE_DELETED': {
+                        const { id } = event.data || {};
+                        if (id) {
+                            await db.sales.delete(Number(id));
+                            if (app.state.currentView === 'sales') app.renderSalesHistory();
+                            if (app.state.currentView === 'dashboard') app.renderDashboard();
+                        }
+                        break;
+                    }
+                    case 'REPAIR_CREATED':
+                    case 'REPAIR_UPDATED': {
+                        const repair = event.data;
+                        if (repair && repair.id) {
+                            await db.repairs.put(repair);
+                            if (app.state.currentView === 'repairs') app.renderRepairs();
+                            if (app.state.currentView === 'dashboard') app.renderDashboard();
+
+                            Swal.fire({
+                                toast: true,
+                                position: 'top-end',
+                                icon: 'info',
+                                title: `🔧 Repair Updated: ${repair.phoneModel} (${repair.status})`,
+                                timer: 2500,
+                                showConfirmButton: false
+                            });
+                        }
+                        break;
+                    }
+                    case 'REPAIR_DELETED': {
+                        const { id } = event.data || {};
+                        if (id) {
+                            await db.repairs.delete(Number(id));
+                            if (app.state.currentView === 'repairs') app.renderRepairs();
+                            if (app.state.currentView === 'dashboard') app.renderDashboard();
+                        }
+                        break;
+                    }
+                    case 'EXPENSE_CREATED': {
+                        const expense = event.data;
+                        if (expense && expense.id) {
+                            await db.expenses.put(expense);
+                            if (app.state.currentView === 'expenses') app.renderExpenses();
+                            if (app.state.currentView === 'dashboard') app.renderDashboard();
+                            if (app.state.currentView === 'reports') app.renderReports();
+                        }
+                        break;
+                    }
+                    case 'EXPENSE_DELETED': {
+                        const { id } = event.data || {};
+                        if (id) {
+                            await db.expenses.delete(Number(id));
+                            if (app.state.currentView === 'expenses') app.renderExpenses();
+                            if (app.state.currentView === 'dashboard') app.renderDashboard();
+                        }
+                        break;
+                    }
+                    case 'CREDITOR_CREATED':
+                    case 'CREDITOR_UPDATED': {
+                        const creditor = event.data;
+                        if (creditor && creditor.id) {
+                            await db.creditors.put(creditor);
+                            if (app.state.currentView === 'credits') app.renderCredits();
+                            if (app.state.currentView === 'pos') app.renderPOS();
+                        }
+                        break;
+                    }
+                    case 'CREDITOR_DELETED': {
+                        const { id } = event.data || {};
+                        if (id) {
+                            await db.creditors.delete(Number(id));
+                            if (app.state.currentView === 'credits') app.renderCredits();
+                            if (app.state.currentView === 'pos') app.renderPOS();
+                        }
+                        break;
+                    }
+                    case 'BANK_TX_CREATED': {
+                        const tx = event.data;
+                        if (tx && tx.id) {
+                            await db.bankTransactions.put(tx);
+                            if (app.state.currentView === 'bank') app.renderBankTracker();
+                            if (app.state.currentView === 'dashboard') app.renderDashboard();
+                        }
+                        break;
+                    }
+                    case 'BANK_TX_DELETED': {
+                        const { id } = event.data || {};
+                        if (id) {
+                            await db.bankTransactions.delete(Number(id));
+                            if (app.state.currentView === 'bank') app.renderBankTracker();
+                        }
+                        break;
+                    }
+                    case 'SUPPLIER_CREATED': {
+                        const supplier = event.data;
+                        if (supplier && supplier.id) {
+                            await db.suppliers.put(supplier);
+                            if (app.state.currentView === 'suppliers') app.renderSuppliers();
+                        }
+                        break;
+                    }
+                    case 'SUPPLIER_DELETED': {
+                        const { id } = event.data || {};
+                        if (id) {
+                            await db.suppliers.delete(Number(id));
+                            if (app.state.currentView === 'suppliers') app.renderSuppliers();
+                        }
+                        break;
+                    }
+                    case 'BILL_CREATED':
+                    case 'BILL_UPDATED': {
+                        const bill = event.data;
+                        if (bill && bill.id) {
+                            await db.purchaseBills.put(bill);
+                            if (app.state.currentView === 'suppliers') app.renderSuppliers();
+                        }
+                        break;
+                    }
+                    case 'BILL_DELETED': {
+                        const { id } = event.data || {};
+                        if (id) {
+                            await db.purchaseBills.delete(Number(id));
+                            if (app.state.currentView === 'suppliers') app.renderSuppliers();
+                        }
+                        break;
+                    }
+                    case 'SETTINGS_UPDATED': {
+                        const { key, value } = event.data || {};
+                        if (key) {
+                            localStorage.setItem(`krishan_pos_${key}`, value);
+                            app.updateShopProfileHeader();
+                        }
+                        break;
+                    }
+                    case 'BATCH_SYNC_COMPLETED': {
+                        await app.syncWithBackend(false);
+                        break;
+                    }
+                    default:
+                        break;
+                }
+            } catch (eventErr) {
+                console.error('Error handling incoming realtime event:', eventErr);
+            }
+        }
     },
 
+    // Unified socket-aware API Caller with direct Supabase & offline queue fallback
+    apiCall: async (pathOrTable, method = 'GET', data = null, offlineAction = null, offlineId = null) => {
+        const serverUrl = app.getServerUrl();
+        const isGitHubPages = window.location.hostname.endsWith('github.io');
+
+        // 1. Try Backend API fetch (Local / VPS / Render / Vercel API)
+        if (serverUrl || !isGitHubPages || typeof supabase === 'undefined') {
+            try {
+                const url = app.getApiUrl(pathOrTable);
+                const headers = app.getAuthHeaders();
+                const options = {
+                    method,
+                    headers,
+                    credentials: 'include'
+                };
+
+                if (data && method !== 'GET') {
+                    options.body = JSON.stringify(data);
+                }
+
+                const res = await fetch(url, options);
+                if (res.ok) {
+                    return await res.json();
+                }
+            } catch (err) {
+                // Backend not reachable, fall through to Supabase or Offline Queue
+            }
+        }
+
+        // 2. Direct Supabase Fallback (for static hosting or when backend server is not running)
+        if (typeof supabase !== 'undefined' && supabase && typeof supabase.from === 'function') {
+            try {
+                let rawTable = pathOrTable.replace(/^\/?api\//, '').split('/')[0];
+                rawTable = rawTable.replace(/-/g, '_');
+                const tableMap = {
+                    'bank_transactions': 'bank_transactions',
+                    'purchase_bills': 'purchase_bills',
+                    'items': 'items',
+                    'sales': 'sales',
+                    'repairs': 'repairs',
+                    'expenses': 'expenses',
+                    'creditors': 'creditors',
+                    'suppliers': 'suppliers',
+                    'settings': 'settings',
+                    'users': 'users'
+                };
+                const tableName = tableMap[rawTable] || rawTable;
+
+                // Format data fields for Supabase schema
+                const toSb = (tbl, item) => {
+                    if (!item || typeof item !== 'object') return item;
+                    const rec = { ...item };
+                    if (tbl === 'sales') {
+                        if (rec.paymentMethod !== undefined) { rec.payment_method = rec.paymentMethod; delete rec.paymentMethod; }
+                        if (rec.cashReceived !== undefined) { rec.cash_received = rec.cashReceived; delete rec.cashReceived; }
+                        if (rec.items !== undefined) { rec.items_json = rec.items; delete rec.items; }
+                        if (rec.customerName !== undefined) { rec.customer_name = rec.customerName; delete rec.customerName; }
+                        if (rec.customerPhone !== undefined) { rec.customer_phone = rec.customerPhone; delete rec.customerPhone; }
+                        if (rec.userId !== undefined) { rec.user_id = rec.userId; delete rec.userId; }
+                        if (rec.isUtility !== undefined) { rec.is_utility = rec.isUtility; delete rec.isUtility; }
+                    } else if (tbl === 'repairs') {
+                        if (rec.customerName !== undefined) { rec.customer_name = rec.customerName; delete rec.customerName; }
+                        if (rec.phoneModel !== undefined) { rec.phone_model = rec.phoneModel; delete rec.phoneModel; }
+                        if (rec.estimatedCost !== undefined) { rec.estimated_cost = rec.estimatedCost; delete rec.estimatedCost; }
+                        if (rec.advancePayment !== undefined) { rec.advance_payment = rec.advancePayment; delete rec.advancePayment; }
+                        if (rec.createdAt !== undefined) { rec.created_at = rec.createdAt; delete rec.createdAt; }
+                    } else if (tbl === 'creditors') {
+                        if (rec.lastUpdated !== undefined) { rec.last_updated = rec.lastUpdated; delete rec.lastUpdated; }
+                    } else if (tbl === 'purchase_bills') {
+                        if (rec.supplierId !== undefined) { rec.supplier_id = rec.supplierId; delete rec.supplierId; }
+                        if (rec.supplierName !== undefined) { rec.supplier_name = rec.supplierName; delete rec.supplierName; }
+                        if (rec.billNumber !== undefined) { rec.bill_number = rec.billNumber; delete rec.billNumber; }
+                        if (rec.totalAmount !== undefined) { rec.total_amount = rec.totalAmount; delete rec.totalAmount; }
+                        if (rec.items !== undefined) { rec.items_json = rec.items; delete rec.items; }
+                    } else if (tbl === 'items') {
+                        if (rec.minStock !== undefined) { rec.min_stock = rec.minStock; delete rec.minStock; }
+                    }
+                    return rec;
+                };
+
+                if (method === 'GET') {
+                    const { data: resData, error } = await supabase.from(tableName).select('*');
+                    if (error) throw error;
+                    return resData;
+                } else if (method === 'POST') {
+                    if (tableName === 'settings' && data && data.key) {
+                        const { data: resData, error } = await supabase.from('settings').upsert([data]).select();
+                        if (error) throw error;
+                        return resData ? resData[0] : null;
+                    }
+                    if (pathOrTable.includes('/adjust-stock')) {
+                        const idMatch = pathOrTable.match(/items\/(\d+)\/adjust-stock/);
+                        if (idMatch && data && data.delta !== undefined) {
+                            const itemId = Number(idMatch[1]);
+                            const { data: curItem } = await supabase.from('items').select('stock').eq('id', itemId).single();
+                            if (curItem) {
+                                const newStock = (curItem.stock || 0) + Number(data.delta);
+                                await supabase.from('items').update({ stock: newStock }).eq('id', itemId);
+                            }
+                            return { success: true };
+                        }
+                    }
+                    const payload = toSb(tableName, data);
+                    const { data: resData, error } = await supabase.from(tableName).upsert([payload]).select();
+                    if (error) throw error;
+                    return resData ? resData[0] : null;
+                } else if (method === 'PUT') {
+                    const id = (data && data.id) || pathOrTable.split('/').pop();
+                    const updateData = toSb(tableName, data);
+                    delete updateData.id;
+                    const { data: resData, error } = await supabase.from(tableName).update(updateData).eq('id', id).select();
+                    if (error) throw error;
+                    return resData ? resData[0] : null;
+                } else if (method === 'DELETE') {
+                    const id = pathOrTable.split('/').pop();
+                    const { error } = await supabase.from(tableName).delete().eq('id', id);
+                    if (error) throw error;
+                    return { success: true };
+                }
+            } catch (sbErr) {
+                console.warn(`Supabase fallback call failed for ${pathOrTable}:`, sbErr.message);
+            }
+        }
+
+        // 3. Fallback to Offline Queue
+        if (offlineAction && data) {
+            app.realtime.queueOfflineMutation(offlineAction, offlineId, data);
+        }
+        return null;
+    },
+
+    // Full Backend & Cloud Database Synchronization
     syncWithBackend: async (refreshView = false) => {
-        if (typeof supabase === 'undefined') {
-            console.warn('Supabase client is not loaded.');
-            return false;
-        }
-
+        // 1. Try Backend API Full Sync endpoint
         try {
-            const [itemsRes, salesRes, repairsRes, expensesRes, creditorsRes, bankRes, supRes, billsRes] = await Promise.all([
-                supabase.from('items').select('*'),
-                supabase.from('sales').select('*'),
-                supabase.from('repairs').select('*'),
-                supabase.from('expenses').select('*'),
-                supabase.from('creditors').select('*'),
-                supabase.from('bankTransactions').select('*'),
-                supabase.from('suppliers').select('*'),
-                supabase.from('purchaseBills').select('*')
-            ]);
+            const res = await fetch(app.getApiUrl('/api/sync/full'), {
+                method: 'GET',
+                headers: app.getAuthHeaders(),
+                credentials: 'include'
+            });
+            if (res.ok) {
+                const payload = await res.json();
+                if (payload && payload.success && payload.data) {
+                    const data = payload.data;
 
-            if (itemsRes.data && itemsRes.data.length > 0) {
-                await db.items.clear();
-                await db.items.bulkPut(itemsRes.data);
-            }
-            if (salesRes.data && salesRes.data.length > 0) {
-                await db.sales.clear();
-                await db.sales.bulkPut(salesRes.data);
-            }
-            if (repairsRes.data && repairsRes.data.length > 0) {
-                await db.repairs.clear();
-                await db.repairs.bulkPut(repairsRes.data);
-            }
-            if (expensesRes.data && expensesRes.data.length > 0) {
-                await db.expenses.clear();
-                await db.expenses.bulkPut(expensesRes.data);
-            }
-            if (creditorsRes.data && creditorsRes.data.length > 0) {
-                await db.creditors.clear();
-                await db.creditors.bulkPut(creditorsRes.data);
-            }
-            if (bankRes.data && bankRes.data.length > 0) {
-                await db.bankTransactions.clear();
-                await db.bankTransactions.bulkPut(bankRes.data);
-            }
-            if (supRes.data && supRes.data.length > 0) {
-                await db.suppliers.clear();
-                await db.suppliers.bulkPut(supRes.data);
-            }
-            if (billsRes.data && billsRes.data.length > 0) {
-                await db.purchaseBills.clear();
-                await db.purchaseBills.bulkPut(billsRes.data);
-            }
+                    if (Array.isArray(data.items)) {
+                        await db.items.clear();
+                        if (data.items.length > 0) await db.items.bulkPut(data.items);
+                    }
+                    if (Array.isArray(data.sales)) {
+                        await db.sales.clear();
+                        if (data.sales.length > 0) await db.sales.bulkPut(data.sales);
+                    }
+                    if (Array.isArray(data.repairs)) {
+                        await db.repairs.clear();
+                        if (data.repairs.length > 0) await db.repairs.bulkPut(data.repairs);
+                    }
+                    if (Array.isArray(data.expenses)) {
+                        await db.expenses.clear();
+                        if (data.expenses.length > 0) await db.expenses.bulkPut(data.expenses);
+                    }
+                    if (Array.isArray(data.creditors)) {
+                        await db.creditors.clear();
+                        if (data.creditors.length > 0) await db.creditors.bulkPut(data.creditors);
+                    }
+                    if (Array.isArray(data.bankTransactions)) {
+                        await db.bankTransactions.clear();
+                        if (data.bankTransactions.length > 0) await db.bankTransactions.bulkPut(data.bankTransactions);
+                    }
+                    if (Array.isArray(data.suppliers)) {
+                        await db.suppliers.clear();
+                        if (data.suppliers.length > 0) await db.suppliers.bulkPut(data.suppliers);
+                    }
+                    if (Array.isArray(data.purchaseBills)) {
+                        await db.purchaseBills.clear();
+                        if (data.purchaseBills.length > 0) await db.purchaseBills.bulkPut(data.purchaseBills);
+                    }
+                    if (data.settings) {
+                        for (const k in data.settings) {
+                            localStorage.setItem(`krishan_pos_${k}`, data.settings[k]);
+                        }
+                        app.updateShopProfileHeader();
+                    }
 
-            app.realtime.lastSyncTime = new Date();
-            app.realtime.setStatus('connected');
+                    app.realtime.lastSyncTime = new Date();
 
-            if (refreshView && app.state.currentView && typeof app.navigate === 'function') {
-                app.navigate(app.state.currentView);
+                    if (refreshView && app.state.currentView) {
+                        app.navigate(app.state.currentView);
+                    }
+                    return true;
+                }
             }
-            return true;
-        } catch (err) {
-            console.error('Supabase sync error:', err.message);
-            return false;
+        } catch (e) {
+            // Backend full sync endpoint unreachable
         }
+
+        // 2. Direct Supabase Multi-Table Sync Fallback
+        if (typeof supabase !== 'undefined' && supabase && typeof supabase.from === 'function') {
+            try {
+                const [itemsRes, salesRes, repairsRes, expensesRes, credRes, bankRes, supRes, billsRes, setRes] = await Promise.all([
+                    supabase.from('items').select('*').catch(() => ({ data: null })),
+                    supabase.from('sales').select('*').catch(() => ({ data: null })),
+                    supabase.from('repairs').select('*').catch(() => ({ data: null })),
+                    supabase.from('expenses').select('*').catch(() => ({ data: null })),
+                    supabase.from('creditors').select('*').catch(() => ({ data: null })),
+                    supabase.from('bank_transactions').select('*').catch(() => ({ data: null })),
+                    supabase.from('suppliers').select('*').catch(() => ({ data: null })),
+                    supabase.from('purchase_bills').select('*').catch(() => ({ data: null })),
+                    supabase.from('settings').select('*').catch(() => ({ data: null }))
+                ]);
+
+                if (itemsRes.data && itemsRes.data.length > 0) {
+                    const formatted = itemsRes.data.map(i => ({
+                        ...i,
+                        minStock: i.min_stock !== undefined ? i.min_stock : (i.minStock || 5)
+                    }));
+                    await db.items.clear();
+                    await db.items.bulkPut(formatted);
+                }
+                if (salesRes.data && salesRes.data.length > 0) {
+                    const formatted = salesRes.data.map(s => ({
+                        id: s.id,
+                        date: s.date,
+                        total: Number(s.total || 0),
+                        discount: Number(s.discount || 0),
+                        paymentMethod: s.payment_method || s.paymentMethod || 'cash',
+                        cashReceived: Number(s.cash_received !== undefined ? s.cash_received : (s.cashReceived || 0)),
+                        change: Number(s.change_amount !== undefined ? s.change_amount : (s.change || 0)),
+                        items: typeof s.items_json === 'string' ? JSON.parse(s.items_json) : (s.items_json || s.items || []),
+                        customerName: s.customer_name || s.customerName || '',
+                        customerPhone: s.customer_phone || s.customerPhone || '',
+                        userId: s.user_id || s.userId || null,
+                        isUtility: Boolean(s.is_utility || s.isUtility)
+                    }));
+                    await db.sales.clear();
+                    await db.sales.bulkPut(formatted);
+                }
+                if (repairsRes.data && repairsRes.data.length > 0) {
+                    const formatted = repairsRes.data.map(r => ({
+                        id: r.id,
+                        customerName: r.customer_name || r.customerName || '',
+                        phoneModel: r.phone_model || r.phoneModel || '',
+                        issue: r.issue || '',
+                        estimatedCost: Number(r.estimated_cost !== undefined ? r.estimated_cost : (r.estimatedCost || 0)),
+                        advancePayment: Number(r.advance_payment !== undefined ? r.advance_payment : (r.advancePayment || 0)),
+                        status: r.status || 'pending',
+                        contact: r.contact || '',
+                        createdAt: r.created_at || r.createdAt || new Date().toISOString()
+                    }));
+                    await db.repairs.clear();
+                    await db.repairs.bulkPut(formatted);
+                }
+                if (expensesRes.data && expensesRes.data.length > 0) {
+                    await db.expenses.clear();
+                    await db.expenses.bulkPut(expensesRes.data);
+                }
+                if (credRes.data && credRes.data.length > 0) {
+                    const formatted = credRes.data.map(c => ({
+                        id: c.id,
+                        name: c.name,
+                        phone: c.phone || '',
+                        amount: Number(c.amount || 0),
+                        type: c.type || 'receivable',
+                        lastUpdated: c.last_updated || c.lastUpdated || new Date().toISOString()
+                    }));
+                    await db.creditors.clear();
+                    await db.creditors.bulkPut(formatted);
+                }
+                if (bankRes.data && bankRes.data.length > 0) {
+                    await db.bankTransactions.clear();
+                    await db.bankTransactions.bulkPut(bankRes.data);
+                }
+                if (supRes.data && supRes.data.length > 0) {
+                    await db.suppliers.clear();
+                    await db.suppliers.bulkPut(supRes.data);
+                }
+                if (billsRes.data && billsRes.data.length > 0) {
+                    const formatted = billsRes.data.map(b => ({
+                        id: b.id,
+                        supplierId: b.supplier_id || b.supplierId || null,
+                        supplierName: b.supplier_name || b.supplierName || '',
+                        billNumber: b.bill_number || b.billNumber || '',
+                        date: b.date,
+                        totalAmount: Number(b.total_amount !== undefined ? b.total_amount : (b.totalAmount || 0)),
+                        status: b.status || 'pending',
+                        items: typeof b.items_json === 'string' ? JSON.parse(b.items_json) : (b.items_json || b.items || [])
+                    }));
+                    await db.purchaseBills.clear();
+                    await db.purchaseBills.bulkPut(formatted);
+                }
+                if (setRes.data && Array.isArray(setRes.data)) {
+                    for (const s of setRes.data) {
+                        if (s.key && s.value) {
+                            localStorage.setItem(`krishan_pos_${s.key}`, s.value);
+                        }
+                    }
+                    app.updateShopProfileHeader();
+                }
+
+                app.realtime.lastSyncTime = new Date();
+                if (refreshView && app.state.currentView) {
+                    app.navigate(app.state.currentView);
+                }
+                return true;
+            } catch (sbSyncErr) {
+                console.warn('Supabase direct sync error:', sbSyncErr.message);
+            }
+        }
+
+        return false;
     },
 
     triggerManualSync: async () => {
         const icon = document.getElementById('manual-sync-icon');
         if (icon) icon.classList.add('fa-spin');
+        app.realtime.setStatus('syncing');
+
         try {
+            await app.realtime.flushOfflineQueue();
             await app.syncWithBackend(true);
-            if (typeof Swal !== 'undefined') {
-                Swal.fire({
-                    toast: true,
-                    position: 'top-end',
-                    icon: 'success',
-                    title: 'Data Synced via Supabase!',
-                    timer: 1500,
-                    showConfirmButton: false
-                });
-            }
+            app.realtime.setStatus('connected');
+            Swal.fire({
+                toast: true,
+                position: 'top-end',
+                icon: 'success',
+                title: 'Data Synced Successfully!',
+                timer: 1500,
+                showConfirmButton: false
+            });
         } catch (e) {
-            if (typeof Swal !== 'undefined') {
+            Swal.fire({
+                toast: true,
+                position: 'top-end',
+                icon: 'error',
+                title: 'Sync failed: ' + (e.message || 'Server offline'),
+                timer: 2000,
+                showConfirmButton: false
+            });
+        } finally {
+            if (icon) icon.classList.remove('fa-spin');
+        }
+    },
+
+    showSyncStatusModal: () => {
+        const status = app.realtime.status;
+        const mode = app.realtime.syncMode || 'websocket';
+        const count = app.realtime.deviceCount || 1;
+        const lastSync = app.realtime.lastSyncTime ? new Date(app.realtime.lastSyncTime).toLocaleTimeString() : 'Just now';
+        const queueCount = app.realtime.pendingQueue.length;
+        const statusColor = status === 'connected' ? 'text-emerald-600 dark:text-emerald-400' : (status === 'syncing' ? 'text-amber-500' : 'text-rose-500');
+        const statusBadge = status === 'connected' ? (mode === 'polling' ? '🟢 Cloud Live (Polling Sync)' : '🟢 Live (WebSocket)') : (status === 'syncing' ? '🟡 Syncing...' : '🔴 Offline Mode');
+        const customUrl = localStorage.getItem('krishan_pos_custom_server_url') || '';
+        const serverHost = customUrl || (window.location.host || 'http://localhost:3000');
+
+        Swal.fire({
+            title: '<div class="flex items-center justify-center gap-2 text-xl font-bold"><i class="fa-solid fa-tower-broadcast text-violet-600"></i> Realtime Sync Status</div>',
+            html: `
+                <div class="text-left space-y-4 my-2 text-sm">
+                    <div class="p-4 rounded-2xl bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 space-y-2.5">
+                        <div class="flex justify-between items-center">
+                            <span class="font-semibold text-slate-500 dark:text-slate-400">Connection State:</span>
+                            <span class="font-bold ${statusColor}">${statusBadge}</span>
+                        </div>
+                        <div class="flex justify-between items-center">
+                            <span class="font-semibold text-slate-500 dark:text-slate-400">Sync Mode:</span>
+                            <span class="font-bold text-slate-700 dark:text-slate-200 uppercase text-xs">${mode}</span>
+                        </div>
+                        <div class="flex justify-between items-center">
+                            <span class="font-semibold text-slate-500 dark:text-slate-400">Connected Devices:</span>
+                            <span class="font-bold text-slate-800 dark:text-white">${count} active device(s)</span>
+                        </div>
+                        <div class="flex justify-between items-center">
+                            <span class="font-semibold text-slate-500 dark:text-slate-400">Last Synced:</span>
+                            <span class="font-bold text-slate-800 dark:text-white">${lastSync}</span>
+                        </div>
+                        <div class="flex justify-between items-center">
+                            <span class="font-semibold text-slate-500 dark:text-slate-400">Pending Offline Queue:</span>
+                            <span class="font-bold ${queueCount > 0 ? 'text-amber-600' : 'text-slate-800 dark:text-white'}">${queueCount} actions</span>
+                        </div>
+                        <div class="flex justify-between items-center text-xs text-slate-400 pt-1 border-t border-slate-200 dark:border-slate-700">
+                            <span>Backend Server URL:</span>
+                            <span class="font-mono text-[11px] truncate max-w-[200px]" title="${serverHost}">${serverHost}</span>
+                        </div>
+                    </div>
+
+                    <div class="flex gap-2">
+                        <button type="button" onclick="app.configureServerUrlModal()" class="w-full py-2 px-3 rounded-xl bg-violet-50 dark:bg-violet-950/50 border border-violet-200 dark:border-violet-800 text-violet-700 dark:text-violet-300 font-bold text-xs hover:bg-violet-100 transition-colors flex items-center justify-center gap-1.5">
+                            <i class="fa-solid fa-cloud-arrow-up"></i> Configure Cloud Server URL
+                        </button>
+                    </div>
+
+                    <p class="text-xs text-slate-400 leading-relaxed">
+                        ✨ Sales, inventory stock, repairs, expenses, and credit records are synced live across all counter PCs, mobile phones, and laptops in real time.
+                    </p>
+                </div>
+            `,
+            showCancelButton: true,
+            confirmButtonText: '<i class="fa-solid fa-arrows-rotate mr-1.5"></i> Force Full Sync',
+            cancelButtonText: 'Close',
+            confirmButtonColor: '#7c3aed'
+        }).then((res) => {
+            if (res.isConfirmed) {
+                app.triggerManualSync();
+            }
+        });
+    },
+
+    configureServerUrlModal: async () => {
+        const currentUrl = localStorage.getItem('krishan_pos_custom_server_url') || '';
+        const { value: url } = await Swal.fire({
+            title: '<i class="fa-solid fa-server text-violet-600 mb-2"></i><br>Cloud Backend Server URL',
+            html: `
+                <div class="text-left text-xs text-slate-500 mb-3 leading-relaxed">
+                    Enter your live backend server URL (e.g. Render, Railway, Cloudflare Tunnel, or Local Network IP). Leave blank to use default.
+                </div>
+                <input id="swal-server-url" class="swal2-input !mt-0 !w-full text-sm font-mono" placeholder="https://my-pos.onrender.com or http://192.168.8.185:3000" value="${currentUrl}">
+                <div class="text-left text-[11px] text-slate-400 mt-2 space-y-1">
+                    <div>💡 <strong>Render Free URL:</strong> <code>https://your-app.onrender.com</code></div>
+                    <div>💡 <strong>Local Wi-Fi IP:</strong> <code>http://192.168.8.185:3000</code></div>
+                </div>
+            `,
+            showCancelButton: true,
+            confirmButtonText: 'Save & Test Connection',
+            confirmButtonColor: '#7c3aed',
+            preConfirm: () => {
+                const val = document.getElementById('swal-server-url').value.trim();
+                return val;
+            }
+        });
+
+        if (url !== undefined) {
+            if (url) {
+                localStorage.setItem('krishan_pos_custom_server_url', url.replace(/\/+$/, ''));
+            } else {
+                localStorage.removeItem('krishan_pos_custom_server_url');
+            }
+
+            Swal.fire({
+                title: 'Connecting...',
+                text: 'Testing connection to server',
+                allowOutsideClick: false,
+                didOpen: () => {
+                    Swal.showLoading();
+                }
+            });
+
+            try {
+                if (app.realtime.socket) {
+                    app.realtime.socket.disconnect();
+                }
+                app.realtime.init();
+                await app.syncWithBackend(true);
                 Swal.fire({
-                    toast: true,
-                    position: 'top-end',
-                    icon: 'error',
-                    title: 'Sync failed: ' + e.message,
+                    icon: 'success',
+                    title: 'Connected Successfully!',
+                    text: 'Live sync connected to ' + (url || 'default server'),
                     timer: 2000,
                     showConfirmButton: false
                 });
+            } catch (e) {
+                Swal.fire({
+                    icon: 'warning',
+                    title: 'Saved in Local Mode',
+                    text: 'Server URL saved. ' + e.message,
+                    timer: 2500,
+                    showConfirmButton: false
+                });
             }
-        } finally {
-            if (icon) icon.classList.remove('fa-spin');
         }
     },
 
@@ -257,156 +1049,43 @@ const app = {
             setInterval(app.updateDateTime, 1000);
             app.initTheme();
 
+            // 1. Initialize Realtime Engine
             app.realtime.init();
 
+            // 2. Verify authentication
             const isAuth = await app.checkAuth();
             if (!isAuth) {
-                if (typeof app.showLoginOverlay === 'function') {
-                    app.showLoginOverlay();
-                }
+                app.showLoginOverlay();
                 return;
             }
 
-            await app.syncWithBackend(false);
-            app.updateShopProfileHeader();
-            if (typeof app.navigate === 'function') {
-                app.navigate('dashboard');
+            // 3. Sync with SQLite backend database
+            try {
+                await app.syncWithBackend(false);
+            } catch (syncErr) {
+                console.warn('Backend sync skipped/failed:', syncErr);
             }
+
+            app.updateShopProfileHeader();
+            app.navigate('dashboard');
         } catch (e) {
             console.error('App init error:', e);
             try {
-                if (typeof app.navigate === 'function') app.navigate('dashboard');
-            } catch (err) { }
-        }
-    },
-
-    checkAuth: async () => {
-        const saved = localStorage.getItem('pos_current_user');
-        if (saved) {
-            try {
-                app.currentUser = JSON.parse(saved);
-                app.updateUserHeader();
-                return true;
-            } catch (err) { }
-        }
-        return false;
-    },
-
-    updateUserHeader: () => {
-        if (!app.currentUser) return;
-        const nameEl = document.getElementById('user-display-name');
-        const roleEl = document.getElementById('user-display-role');
-        const avatarEl = document.getElementById('user-avatar-initials');
-        const usersNav = document.getElementById('sidebar-users-item');
-
-        if (nameEl) nameEl.textContent = app.currentUser.name || app.currentUser.username;
-        if (roleEl) roleEl.textContent = app.currentUser.role || 'cashier';
-        if (avatarEl) {
-            const initial = (app.currentUser.name || app.currentUser.username || 'U').charAt(0).toUpperCase();
-            avatarEl.textContent = initial;
+                app.navigate('dashboard');
+            } catch (err) {}
         }
 
-        if (usersNav) {
-            if (app.currentUser.role === 'admin') {
-                usersNav.classList.remove('hidden');
-            } else {
-                usersNav.classList.add('hidden');
-            }
-        }
-    },
-
-    logout: async () => {
-        if (typeof Swal !== 'undefined') {
-            const result = await Swal.fire({
-                title: 'Log out?',
-                text: 'Are you sure you want to log out of Krishan POS?',
-                icon: 'question',
-                showCancelButton: true,
-                confirmButtonText: 'Yes, Logout',
-                cancelButtonText: 'Cancel',
-                confirmButtonColor: '#ef4444'
-            });
-
-            if (!result.isConfirmed) return;
-        }
-
-        localStorage.removeItem('pos_current_user');
-        localStorage.removeItem('pos_token');
-        app.currentUser = null;
-        window.location.href = 'login.html';
-    },
-
-    initTheme: () => {
-        const isDark = localStorage.getItem('krishan_pos_theme') === 'dark';
-        if (isDark) {
-            document.documentElement.classList.add('dark');
-        } else {
-            document.documentElement.classList.remove('dark');
-        }
-    },
-
-    toggleDarkMode: () => {
-        const html = document.documentElement;
-        if (html.classList.contains('dark')) {
-            html.classList.remove('dark');
-            localStorage.setItem('krishan_pos_theme', 'light');
-        } else {
-            html.classList.add('dark');
-            localStorage.setItem('krishan_pos_theme', 'dark');
-        }
-    },
-
-    getShopProfile: () => ({
-        shopName: localStorage.getItem('krishan_pos_shop_name') || 'Krishan Communication & Studio',
-        ownerName: localStorage.getItem('krishan_pos_owner_name') || 'Owner',
-        phone: localStorage.getItem('krishan_pos_phone') || '',
-        address: localStorage.getItem('krishan_pos_address') || ''
-    }),
-
-    saveShopProfile: (profile) => {
-        localStorage.setItem('krishan_pos_shop_name', profile.shopName || 'Krishan Communication & Studio');
-        localStorage.setItem('krishan_pos_owner_name', profile.ownerName || 'Owner');
-        localStorage.setItem('krishan_pos_phone', profile.phone || '');
-        localStorage.setItem('krishan_pos_address', profile.address || '');
-    },
-
-    updateShopProfileHeader: () => {
-        const profile = app.getShopProfile();
-        const shopLabel = document.getElementById('shop-profile-name');
-        if (shopLabel) shopLabel.textContent = profile.shopName;
-    },
-
-    updateDateTime: () => {
-        const now = new Date();
-        const timeEl = document.getElementById('current-time');
-        const dateEl = document.getElementById('current-date');
-        if (timeEl) timeEl.textContent = now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
-        if (dateEl) dateEl.textContent = now.toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+        // Global Error Handler
+        window.addEventListener('unhandledrejection', (event) => {
+            console.error('Unhandled promise rejection:', event.reason);
+        });
     },
 
     toggleSidebar: (forceState) => {
         const sidebar = document.getElementById('main-sidebar');
         const backdrop = document.getElementById('sidebar-backdrop');
         if (!sidebar) return;
-
-        const isHidden = sidebar.classList.contains('-translate-x-full');
-        const shouldShow = forceState !== undefined ? forceState : isHidden;
-
-        if (shouldShow) {
-            sidebar.classList.remove('-translate-x-full');
-            if (backdrop) backdrop.classList.remove('hidden');
-        } else {
-            sidebar.classList.add('-translate-x-full');
-            if (backdrop) backdrop.classList.add('hidden');
-        }
-    }
-
-
-    toggleSidebar: (forceState) => {
-        const sidebar = document.getElementById('main-sidebar');
-        const backdrop = document.getElementById('sidebar-backdrop');
-        if (!sidebar) return;
-
+        
         const isHidden = sidebar.classList.contains('-translate-x-full');
         const shouldShow = forceState !== undefined ? forceState : isHidden;
 
@@ -603,7 +1282,7 @@ const app = {
                 app.currentUser = JSON.parse(saved);
                 app.updateUserHeader();
                 return true;
-            } catch (err) { }
+            } catch (err) {}
         }
         return false;
     },
@@ -645,79 +1324,14 @@ const app = {
         if (result.isConfirmed) {
             try {
                 await fetch(app.getApiUrl('/api/auth/logout'), { method: 'POST', credentials: 'include' });
-            } catch (e) { }
+            } catch (e) {}
             localStorage.removeItem('pos_current_user');
             app.currentUser = null;
             app.showLoginOverlay();
         }
     },
 
-    syncWithBackend: async (refreshView = false) => {
-        try {
-            const [items, sales, repairs, expenses, creditors, bankTx, suppliers, bills, settings] = await Promise.all([
-                fetch(app.getApiUrl('/api/items'), { credentials: 'include' }).then(r => r.ok ? r.json() : []).catch(() => []),
-                fetch(app.getApiUrl('/api/sales'), { credentials: 'include' }).then(r => r.ok ? r.json() : []).catch(() => []),
-                fetch(app.getApiUrl('/api/repairs'), { credentials: 'include' }).then(r => r.ok ? r.json() : []).catch(() => []),
-                fetch(app.getApiUrl('/api/expenses'), { credentials: 'include' }).then(r => r.ok ? r.json() : []).catch(() => []),
-                fetch(app.getApiUrl('/api/creditors'), { credentials: 'include' }).then(r => r.ok ? r.json() : []).catch(() => []),
-                fetch(app.getApiUrl('/api/bank-transactions'), { credentials: 'include' }).then(r => r.ok ? r.json() : []).catch(() => []),
-                fetch(app.getApiUrl('/api/suppliers'), { credentials: 'include' }).then(r => r.ok ? r.json() : []).catch(() => []),
-                fetch(app.getApiUrl('/api/purchase-bills'), { credentials: 'include' }).then(r => r.ok ? r.json() : []).catch(() => []),
-                fetch(app.getApiUrl('/api/settings'), { credentials: 'include' }).then(r => r.ok ? r.json() : {}).catch(() => ({}))
-            ]);
 
-            await db.transaction('rw', db.items, db.sales, db.repairs, db.expenses, db.creditors, db.bankTransactions, db.suppliers, db.purchaseBills, async () => {
-                if (items && Array.isArray(items) && items.length > 0) {
-                    await db.items.clear();
-                    await db.items.bulkAdd(items);
-                }
-                if (sales && Array.isArray(sales) && sales.length > 0) {
-                    await db.sales.clear();
-                    await db.sales.bulkAdd(sales);
-                }
-                if (repairs && Array.isArray(repairs) && repairs.length > 0) {
-                    await db.repairs.clear();
-                    await db.repairs.bulkAdd(repairs);
-                }
-                if (expenses && Array.isArray(expenses) && expenses.length > 0) {
-                    await db.expenses.clear();
-                    await db.expenses.bulkAdd(expenses);
-                }
-                if (creditors && Array.isArray(creditors) && creditors.length > 0) {
-                    await db.creditors.clear();
-                    await db.creditors.bulkAdd(creditors);
-                }
-                if (bankTx && Array.isArray(bankTx) && bankTx.length > 0) {
-                    await db.bankTransactions.clear();
-                    await db.bankTransactions.bulkAdd(bankTx);
-                }
-                if (suppliers && Array.isArray(suppliers) && suppliers.length > 0) {
-                    await db.suppliers.clear();
-                    await db.suppliers.bulkAdd(suppliers);
-                }
-                if (bills && Array.isArray(bills) && bills.length > 0) {
-                    await db.purchaseBills.clear();
-                    await db.purchaseBills.bulkAdd(bills);
-                }
-            });
-
-            if (settings && typeof settings === 'object') {
-                if (settings.shop_name) localStorage.setItem('krishan_pos_shop_name', settings.shop_name);
-                if (settings.owner_name) localStorage.setItem('krishan_pos_owner_name', settings.owner_name);
-                if (settings.phone) localStorage.setItem('krishan_pos_phone', settings.phone);
-                if (settings.address) localStorage.setItem('krishan_pos_address', settings.address);
-                app.updateShopProfileHeader();
-            }
-
-            app.realtime.lastSyncTime = new Date();
-
-            if (refreshView && app.state.currentView) {
-                app.navigate(app.state.currentView);
-            }
-        } catch (err) {
-            console.warn('Backend sync warning:', err);
-        }
-    },
 
     initTheme: () => {
         const isDark = localStorage.getItem('krishan_pos_theme') === 'dark';
@@ -962,10 +1576,11 @@ const app = {
                                             @${u.username}
                                         </td>
                                         <td class="p-4">
-                                            <span class="px-3 py-1 rounded-full text-xs font-bold ${u.role === 'admin'
-                ? 'bg-purple-100 text-purple-700 dark:bg-purple-900/40 dark:text-purple-300'
-                : 'bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300'
-            }">
+                                            <span class="px-3 py-1 rounded-full text-xs font-bold ${
+                                                u.role === 'admin'
+                                                    ? 'bg-purple-100 text-purple-700 dark:bg-purple-900/40 dark:text-purple-300'
+                                                    : 'bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300'
+                                            }">
                                                 <i class="fa-solid ${u.role === 'admin' ? 'fa-shield-halved' : 'fa-cash-register'} mr-1"></i>
                                                 ${u.role.toUpperCase()}
                                             </span>
@@ -1260,7 +1875,7 @@ const app = {
             const newId = await db.bankTransactions.add(txRecord);
             app.apiCall('/api/bank-transactions', 'POST', { id: newId, ...txRecord }, 'create_bank_tx');
             app.renderBankTracker();
-
+            
             Swal.fire({
                 icon: 'success',
                 title: 'Transaction Saved',
@@ -1320,9 +1935,9 @@ const app = {
                             ` : `
                                 <div class="divide-y divide-slate-100 max-h-[500px] overflow-y-auto">
                                     ${suppliers.map(s => {
-            const supplierBills = bills.filter(b => b.supplierId === s.id);
-            const pendingTotal = supplierBills.reduce((sum, b) => sum + (b.total - (b.paidAmount || 0)), 0);
-            return `
+                                        const supplierBills = bills.filter(b => b.supplierId === s.id);
+                                        const pendingTotal = supplierBills.reduce((sum, b) => sum + (b.total - (b.paidAmount || 0)), 0);
+                                        return `
                                             <div onclick="app.viewSupplierBills(${s.id})" 
                                                  class="supplier-item-${s.id} p-5 hover:bg-slate-50 cursor-pointer transition-all flex items-center justify-between group">
                                                 <div class="space-y-1">
@@ -1344,7 +1959,7 @@ const app = {
                                                 </button>
                                             </div>
                                         `;
-        }).join('')}
+                                    }).join('')}
                                 </div>
                             `}
                         </div>
@@ -1504,10 +2119,10 @@ const app = {
                     Swal.showValidationMessage('මුදල ඇතුළත් කිරීම අනිවාර්යයි');
                     return false;
                 }
-                return {
-                    total, note, status, supplierId,
+                return { 
+                    total, note, status, supplierId, 
                     date: new Date().toISOString(),
-                    paidAmount: status === 'paid' ? total : 0
+                    paidAmount: status === 'paid' ? total : 0 
                 };
             }
         });
@@ -1554,18 +2169,18 @@ const app = {
         if (paidAmount !== undefined) {
             const newTotalPaid = currentPaid + paidAmount;
             const newStatus = newTotalPaid >= bill.total ? 'paid' : 'pending';
-
-            const updatedBill = {
+            
+            const updatedBill = { 
                 ...bill,
                 paidAmount: newTotalPaid,
                 status: newStatus
             };
-            await db.purchaseBills.update(billId, {
+            await db.purchaseBills.update(billId, { 
                 paidAmount: newTotalPaid,
                 status: newStatus
             });
             app.apiCall(`/api/purchase-bills/${billId}`, 'PUT', updatedBill, 'update_bill', billId);
-
+            
             app.viewSupplierBills(supplierId);
             app.renderSuppliers();
             Swal.fire({ icon: 'success', title: 'ගෙවීම සටහන් විය', timer: 1000, showConfirmButton: false });
@@ -1959,8 +2574,8 @@ const app = {
                 document.getElementById('pos-search').value = '';
                 return;
             }
-            filtered = filtered.filter(i =>
-                i.name.toLowerCase().includes(lowerQ) ||
+            filtered = filtered.filter(i => 
+                i.name.toLowerCase().includes(lowerQ) || 
                 (i.barcode && i.barcode.toLowerCase().includes(lowerQ)) ||
                 (i.price.toString() === query || i.price.toString().startsWith(query))
             );
@@ -2009,7 +2624,7 @@ const app = {
         let filtered = activeCategory === 'All' ? allItems : allItems.filter(i => i.category === activeCategory);
 
         const lowerQ = query.toLowerCase();
-
+        
         // 1. Check exact barcode match
         const barcodeMatch = filtered.find(i => i.barcode === query);
         if (barcodeMatch) {
@@ -2022,7 +2637,7 @@ const app = {
         // 2. Check if it's a pure number - if so, add as custom amount
         const numQuery = parseFloat(query);
         const nameMatches = filtered.filter(i => i.name.toLowerCase().includes(lowerQ));
-
+        
         if (!isNaN(numQuery) && numQuery > 0 && nameMatches.length === 0) {
             // It's a number and no name matches, so add as custom amount
             app.addDirectAmount(query);
@@ -2282,7 +2897,7 @@ const app = {
         } else {
             app.state.selectedCreditor = await db.creditors.get(Number(id));
         }
-        await app.renderPOS();
+        await app.renderPOS(); 
         if (prevSearch) {
             const newSearch = document.getElementById('pos-search');
             if (newSearch) {
@@ -2294,7 +2909,7 @@ const app = {
 
     openCustomerSearch: async () => {
         const creditors = await db.creditors.where('type').equals('receivable').toArray();
-
+        
         const { value: selectedId } = await Swal.fire({
             title: 'ගනුදෙනුකරු සොයන්න (Search Customer)',
             html: `
@@ -2445,14 +3060,14 @@ const app = {
             // 2. Update Creditor Balance if applicable
             if (creditor) {
                 const newDebt = totalOutstanding - amountPaid;
-                const updatedCred = {
+                const updatedCred = { 
                     ...creditor,
                     amount: newDebt,
-                    lastUpdated: new Date().toISOString()
+                    lastUpdated: new Date().toISOString() 
                 };
-                await db.creditors.update(creditor.id, {
+                await db.creditors.update(creditor.id, { 
                     amount: newDebt,
-                    lastUpdated: updatedCred.lastUpdated
+                    lastUpdated: updatedCred.lastUpdated 
                 });
                 app.apiCall(`/api/creditors/${creditor.id}`, 'PUT', updatedCred, 'update_creditor', creditor.id);
             }
@@ -2553,6 +3168,45 @@ const app = {
                 }
             }
         });
+    },
+
+    toggleItemScanner: () => {
+        const container = document.getElementById('scan-container');
+        if (!container) return;
+
+        if (container.classList.contains('hidden')) {
+            container.classList.remove('hidden');
+            try {
+                if (typeof Html5QrcodeScanner !== 'undefined') {
+                    app.state.modalScanner = new Html5QrcodeScanner("modal-reader", {
+                        fps: 10,
+                        qrbox: { width: 220, height: 150 },
+                        aspectRatio: 1.0
+                    }, false);
+
+                    app.state.modalScanner.render((decodedText) => {
+                        const input = document.getElementById('swal-barcode');
+                        if (input) {
+                            input.value = decodedText;
+                            app.updateBarcodePreview(decodedText);
+                        }
+                        app.toggleItemScanner();
+                    }, (err) => {
+                        // ignore frame parse errors
+                    });
+                }
+            } catch (e) {
+                console.warn('Item scanner init error:', e);
+            }
+        } else {
+            container.classList.add('hidden');
+            if (app.state.modalScanner) {
+                try {
+                    app.state.modalScanner.clear();
+                } catch (e) {}
+                app.state.modalScanner = null;
+            }
+        }
     },
 
     handleScan: async (code) => {
@@ -3104,7 +3758,7 @@ const app = {
                 const phoneModel = document.getElementById('rep-model').value;
                 const issue = document.getElementById('rep-issue').value;
                 const cost = parseFloat(document.getElementById('rep-cost').value) || 0;
-
+                
                 if (!customerName || !phoneModel || !issue) {
                     Swal.showValidationMessage('Please fill in Customer Name, Model and Issue');
                     return false;
@@ -3262,9 +3916,7 @@ const app = {
         document.getElementById('app-content').innerHTML = html;
     },
 
-    exportData: async () => {
-        window.location.href = '/api/backup/export';
-    },
+
 
     // --- CREDIT BOOK (NAYA POTHA) ---
     renderCredits: async () => {
@@ -3378,7 +4030,7 @@ const app = {
         if (formValues) {
             const newId = await db.creditors.add(formValues);
             app.apiCall('/api/creditors', 'POST', { id: newId, ...formValues }, 'create_creditor');
-
+            
             // Re-render current view
             const activeNav = document.querySelector('nav a.bg-violet-600')?.innerText?.toLowerCase() || '';
             if (activeNav.includes('pos')) {
@@ -3386,7 +4038,7 @@ const app = {
             } else {
                 app.renderCredits();
             }
-
+            
             Swal.fire({ icon: 'success', title: 'Record Added', timer: 1000, showConfirmButton: false });
         }
     },
@@ -3394,7 +4046,7 @@ const app = {
     updateCreditorAmount: async (id, multiplier) => {
         const creditor = await db.creditors.get(id);
         const isDebtor = creditor.amount >= 0; // True if they owe us (Customer)
-
+        
         let title = '';
         if (multiplier > 0) {
             title = isDebtor ? 'ණයට ලබාදීම (Add New Debt)' : 'ණය ගැනීම වැඩි කිරීම (Increase Payable)';
@@ -3533,8 +4185,8 @@ const app = {
                  </div>
              </div>
         `;
-        document.getElementById('app-content').innerHTML = html;
-    },
+    document.getElementById('app-content').innerHTML = html;
+},
 
     // --- REPORTING ACTIONS ---
     renderExpenses: async () => {
@@ -3543,7 +4195,7 @@ const app = {
         app.renderReports();
     },
 
-    // --- UTILITY BILLS ---
+        // --- UTILITY BILLS ---
     renderUtilityBills: async () => {
         const html = `
             <div class="max-w-4xl mx-auto fade-in">
@@ -3611,7 +4263,7 @@ const app = {
     addUtilityRow: (type = 'CEB') => {
         const container = document.getElementById('utility-rows-container');
         const row = document.createElement('div');
-
+        
         const typeIcons = {
             'CEB': '<img src="http://slcgdxb.com/wp-content/uploads/2021/07/CEB-Logo.jpg" class="w-14 h-14 object-contain rounded-md transform scale-125">',
             'Water': '<img src="https://www.waterboard.lk/wp-content/uploads/2022/11/Water-Board-Logo.png" class="w-14 h-14 object-contain rounded-md transform scale-125">',
@@ -3702,7 +4354,7 @@ const app = {
             const refNo = row.querySelector('.util-ref').value;
             const billAmount = parseFloat(row.querySelector('.util-amount').value);
             const otherName = row.querySelector('.util-other-name')?.value || '';
-
+            
             if (!accNo || isNaN(billAmount) || billAmount <= 0) {
                 Swal.fire({ icon: 'error', title: 'Invalid Entry', text: 'Please enter Account Number and Amount.' });
                 return;
@@ -3766,26 +4418,46 @@ const app = {
     },
 
     filterTable: (tableId, query) => {
-        const rows = document.querySelectorAll(`#${tableId} tbody tr`);
-        rows.forEach(row => {
-            const text = row.innerText.toLowerCase();
-            row.style.display = text.includes(query.toLowerCase()) ? '' : 'none';
-        });
-    },
+            const rows = document.querySelectorAll(`#${tableId} tbody tr`);
+            rows.forEach(row => {
+                const text = row.innerText.toLowerCase();
+                row.style.display = text.includes(query.toLowerCase()) ? '' : 'none';
+            });
+        },
 
     exportData: async () => {
-        const data = {
-            items: await db.items.toArray(),
-            sales: await db.sales.toArray(),
-            repairs: await db.repairs.toArray(),
-            expenses: await db.expenses.toArray()
-        };
-        const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = `backup-${new Date().toISOString().split('T')[0]}.json`;
-        a.click();
+        try {
+            const data = {
+                items: await db.items.toArray(),
+                sales: await db.sales.toArray(),
+                repairs: await db.repairs.toArray(),
+                expenses: await db.expenses.toArray(),
+                creditors: await db.creditors.toArray(),
+                bankTransactions: await db.bankTransactions.toArray(),
+                suppliers: await db.suppliers.toArray(),
+                purchaseBills: await db.purchaseBills.toArray(),
+                exportedAt: new Date().toISOString()
+            };
+            const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `krishan-pos-backup-${new Date().toISOString().split('T')[0]}.json`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+            Swal.fire({
+                toast: true,
+                position: 'top-end',
+                icon: 'success',
+                title: 'Database backup downloaded successfully!',
+                timer: 2000,
+                showConfirmButton: false
+            });
+        } catch (e) {
+            Swal.fire('Export Error', e.message, 'error');
+        }
     },
 
     printReceipt: async (saleId) => {
@@ -3816,7 +4488,7 @@ const app = {
                     <div style="font-weight:600;line-height:1.15;">${item.name}</div>
                     <div style="font-size:12px;font-weight:500;">${item.qty} x LKR ${item.price.toFixed(2)}</div>
                 </div>
-                <div style="font-weight:600;align-self:flex-end;white-space:nowrap;">LKR ${(item.qty * item.price).toFixed(2)}</div>
+                <div style="font-weight:600;align-self:flex-end;white-space:nowrap;">LKR ${(item.qty*item.price).toFixed(2)}</div>
             </div>
         `).join('');
 
@@ -3866,7 +4538,7 @@ const app = {
                     <div style="text-align:center;font-size:14px;font-weight:700;text-transform:uppercase;">${sale.isUtility ? saleDisplayName : 'RECEIPT / INVOICE'}</div>
                     <div style="display:flex;justify-content:space-between;">
                         <span>#${saleId}</span>
-                        <span>${new Date(sale.date).toLocaleDateString()} ${new Date(sale.date).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+                        <span>${new Date(sale.date).toLocaleDateString()} ${new Date(sale.date).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}</span>
                         <span>${sale.paymentMethod.toUpperCase()}</span>
                     </div>
                 </div>
@@ -3877,7 +4549,7 @@ const app = {
                 ${sale.isUtility ? sale.items.map(i => `
                 <div class="ubox">
                     <div style="font-weight:700;text-decoration:underline;font-size:13px;">UTILITY PAYMENT</div>
-                    <div>Type: ${i.utilityType === 'Other' ? (i.otherName || 'Utility Bill') : (typeNames[i.utilityType] || i.utilityType)}</div>
+                    <div>Type: ${i.utilityType === 'Other' ? (i.otherName||'Utility Bill') : (typeNames[i.utilityType]||i.utilityType)}</div>
                     <div>Acc: ${i.accNo}</div>
                     ${i.ref ? `<div>Ref: ${i.ref}</div>` : ''}
                     <div class="sep" style="margin:3px 0;"></div>
