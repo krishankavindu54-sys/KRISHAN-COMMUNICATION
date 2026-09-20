@@ -3,7 +3,8 @@
 
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <meta name="viewport"
+        content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
     <title>Krishan Communication POS</title>
 
     <!-- Tailwind CSS -->
@@ -28,7 +29,8 @@
     <script src="https://unpkg.com/html5-qrcode" type="text/javascript"></script>
 
     <!-- Favicon -->
-    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏪</text></svg>">
+    <link rel="icon"
+        href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏪</text></svg>">
 
     <!-- JsBarcode (Barcode Generator) -->
     <script src="https://cdn.jsdelivr.net/npm/jsbarcode@3.11.5/dist/JsBarcode.all.min.js"></script>
@@ -40,7 +42,8 @@
             document.write('<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"><\/script>');
         }
     </script>
-
+    <script
+        src="[https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2](https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2)"></script>
     <style>
         body {
             font-family: 'Outfit', sans-serif;
@@ -52,7 +55,10 @@
 
         /* Prevent auto-zoom on mobile inputs */
         @media (max-width: 640px) {
-            input, select, textarea {
+
+            input,
+            select,
+            textarea {
                 font-size: 16px !important;
             }
         }
@@ -101,7 +107,9 @@
         html.dark body {
             background: linear-gradient(135deg, #020617 0%, #0f172a 50%, #1e1b4b 100%) !important;
             color: #f8fafc !important;
-        }.sidebar-item {
+        }
+
+        .sidebar-item {
             transition: all 0.2s ease;
         }
 
@@ -415,7 +423,8 @@
     </style>
 </head>
 
-<body class="text-slate-800 h-screen flex overflow-hidden relative z-0 antialiased selection:bg-violet-500 selection:text-white">
+<body
+    class="text-slate-800 h-screen flex overflow-hidden relative z-0 antialiased selection:bg-violet-500 selection:text-white">
 
     <!-- Mobile Sidebar Backdrop Overlay -->
     <div id="sidebar-backdrop" onclick="app.toggleSidebar(false)"
@@ -424,11 +433,12 @@
     <!-- Sidebar (Off-canvas Drawer on mobile, Fixed on desktop) -->
     <aside id="main-sidebar"
         class="w-72 lg:w-64 bg-white dark:bg-slate-900 h-full flex flex-col shadow-2xl lg:shadow-xl z-40 fixed lg:relative -translate-x-full lg:translate-x-0 transition-transform duration-300 ease-in-out border-r border-slate-200/50 dark:border-slate-700/50">
-        
+
         <!-- Sidebar Brand Header -->
         <div class="p-5 sm:p-6 border-b border-slate-100 dark:border-slate-800 flex items-center justify-between">
             <div class="flex items-center gap-3">
-                <div class="w-11 h-11 bg-gradient-to-tr from-violet-600 to-indigo-600 rounded-2xl flex items-center justify-center text-white text-xl font-bold shadow-lg shadow-violet-500/25">
+                <div
+                    class="w-11 h-11 bg-gradient-to-tr from-violet-600 to-indigo-600 rounded-2xl flex items-center justify-center text-white text-xl font-bold shadow-lg shadow-violet-500/25">
                     <i class="fa-solid fa-store"></i>
                 </div>
                 <div>
@@ -436,7 +446,8 @@
                     <p class="text-[11px] font-medium text-violet-600 dark:text-violet-400">Communication & Studio</p>
                 </div>
             </div>
-            <button onclick="app.toggleSidebar(false)" class="lg:hidden w-8 h-8 rounded-lg bg-slate-100 dark:bg-slate-800 text-slate-500 flex items-center justify-center hover:text-slate-700">
+            <button onclick="app.toggleSidebar(false)"
+                class="lg:hidden w-8 h-8 rounded-lg bg-slate-100 dark:bg-slate-800 text-slate-500 flex items-center justify-center hover:text-slate-700">
                 <i class="fa-solid fa-xmark"></i>
             </button>
         </div>
@@ -544,43 +555,56 @@
         <!-- Top Responsive Header -->
         <header
             class="h-16 bg-white/95 dark:bg-slate-900/95 backdrop-blur shadow-sm flex items-center justify-between px-3 sm:px-6 z-10 border-b border-slate-200/50 dark:border-slate-700/50">
-            
+
             <!-- Left: Mobile Hamburger & Date/Time -->
             <div class="flex items-center gap-3">
                 <button onclick="app.toggleSidebar()"
-                    class="lg:hidden w-10 h-10 rounded-xl bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 text-slate-700 dark:text-slate-200 flex items-center justify-center transition-all shadow-sm" title="Open Menu">
+                    class="lg:hidden w-10 h-10 rounded-xl bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 text-slate-700 dark:text-slate-200 flex items-center justify-center transition-all shadow-sm"
+                    title="Open Menu">
                     <i class="fa-solid fa-bars text-lg"></i>
                 </button>
                 <div class="flex flex-col leading-tight">
-                    <span id="current-date" class="text-slate-500 dark:text-slate-400 text-[11px] font-medium hidden sm:inline"></span>
-                    <span id="current-time" class="text-slate-800 dark:text-slate-200 text-sm sm:text-base font-bold"></span>
+                    <span id="current-date"
+                        class="text-slate-500 dark:text-slate-400 text-[11px] font-medium hidden sm:inline"></span>
+                    <span id="current-time"
+                        class="text-slate-800 dark:text-slate-200 text-sm sm:text-base font-bold"></span>
                 </div>
-                <div onclick="app.editShopProfile()" class="hidden md:flex items-center gap-2 rounded-full bg-violet-50 dark:bg-violet-900/20 hover:bg-violet-100 border border-violet-100 dark:border-violet-800/40 px-3 py-1 cursor-pointer transition-colors" title="Click to edit shop details">
+                <div onclick="app.editShopProfile()"
+                    class="hidden md:flex items-center gap-2 rounded-full bg-violet-50 dark:bg-violet-900/20 hover:bg-violet-100 border border-violet-100 dark:border-violet-800/40 px-3 py-1 cursor-pointer transition-colors"
+                    title="Click to edit shop details">
                     <i class="fa-solid fa-shop text-violet-600 text-xs"></i>
-                    <span id="shop-profile-name" class="text-xs font-bold text-violet-700 dark:text-violet-300">Krishan Communication</span>
+                    <span id="shop-profile-name" class="text-xs font-bold text-violet-700 dark:text-violet-300">Krishan
+                        Communication</span>
                 </div>
             </div>
 
             <!-- Right Header Actions -->
             <div class="flex items-center gap-2 sm:gap-3">
                 <!-- Realtime Live Sync Status Badge -->
-                <div id="realtime-sync-widget" onclick="app.showSyncStatusModal()" class="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800 text-emerald-700 dark:text-emerald-300 text-xs font-bold cursor-pointer transition-all hover:scale-105 shadow-sm" title="Realtime Live Sync: Connected. Click to view details.">
+                <div id="realtime-sync-widget" onclick="app.showSyncStatusModal()"
+                    class="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800 text-emerald-700 dark:text-emerald-300 text-xs font-bold cursor-pointer transition-all hover:scale-105 shadow-sm"
+                    title="Realtime Live Sync: Connected. Click to view details.">
                     <span class="relative flex h-2 w-2">
-                        <span id="sync-pulse" class="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                        <span id="sync-pulse"
+                            class="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
                         <span id="sync-dot" class="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
                     </span>
                     <span id="sync-status-text" class="hidden sm:inline">Live</span>
-                    <span id="sync-device-badge" class="px-1.5 py-0.2 rounded-full bg-emerald-200/60 dark:bg-emerald-800/60 text-[10px]" title="Connected Devices">1</span>
+                    <span id="sync-device-badge"
+                        class="px-1.5 py-0.2 rounded-full bg-emerald-200/60 dark:bg-emerald-800/60 text-[10px]"
+                        title="Connected Devices">1</span>
                 </div>
 
                 <!-- Manual Sync Action Button -->
                 <button id="manual-sync-btn" onclick="app.triggerManualSync()"
-                    class="w-9 h-9 sm:w-10 sm:h-10 rounded-full bg-slate-100 dark:bg-slate-800 hover:bg-violet-50 dark:hover:bg-slate-700 text-slate-600 dark:text-slate-300 hover:text-violet-600 flex items-center justify-center border border-slate-200/60 dark:border-slate-700 transition-all shadow-sm" title="Sync All Data with Server">
+                    class="w-9 h-9 sm:w-10 sm:h-10 rounded-full bg-slate-100 dark:bg-slate-800 hover:bg-violet-50 dark:hover:bg-slate-700 text-slate-600 dark:text-slate-300 hover:text-violet-600 flex items-center justify-center border border-slate-200/60 dark:border-slate-700 transition-all shadow-sm"
+                    title="Sync All Data with Server">
                     <i id="manual-sync-icon" class="fa-solid fa-arrows-rotate text-sm"></i>
                 </button>
 
                 <button onclick="app.toggleDarkMode()"
-                    class="w-9 h-9 sm:w-10 sm:h-10 rounded-full bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 text-slate-600 dark:text-slate-300 flex items-center justify-center border border-slate-200/60 dark:border-slate-700 transition-all shadow-sm" title="Toggle Theme">
+                    class="w-9 h-9 sm:w-10 sm:h-10 rounded-full bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 text-slate-600 dark:text-slate-300 flex items-center justify-center border border-slate-200/60 dark:border-slate-700 transition-all shadow-sm"
+                    title="Toggle Theme">
                     <i id="theme-icon" class="fa-solid fa-moon text-sm"></i>
                 </button>
 
@@ -590,14 +614,20 @@
                 </button>
 
                 <!-- User Profile & Logout Widget -->
-                <div class="flex items-center gap-1.5 sm:gap-2 pl-1 sm:pl-2 border-l border-slate-200 dark:border-slate-700">
-                    <div class="flex items-center gap-2 px-2.5 py-1 rounded-full bg-slate-100 dark:bg-slate-800 border border-slate-200/60 dark:border-slate-700">
-                        <div class="w-6 h-6 rounded-full bg-violet-600 text-white flex items-center justify-center text-[10px] font-bold" id="user-avatar-initials">
+                <div
+                    class="flex items-center gap-1.5 sm:gap-2 pl-1 sm:pl-2 border-l border-slate-200 dark:border-slate-700">
+                    <div
+                        class="flex items-center gap-2 px-2.5 py-1 rounded-full bg-slate-100 dark:bg-slate-800 border border-slate-200/60 dark:border-slate-700">
+                        <div class="w-6 h-6 rounded-full bg-violet-600 text-white flex items-center justify-center text-[10px] font-bold"
+                            id="user-avatar-initials">
                             A
                         </div>
-                        <span id="user-display-name" class="text-xs font-bold text-slate-800 dark:text-slate-200 max-w-[80px] truncate hidden sm:inline">Admin</span>
+                        <span id="user-display-name"
+                            class="text-xs font-bold text-slate-800 dark:text-slate-200 max-w-[80px] truncate hidden sm:inline">Admin</span>
                     </div>
-                    <button onclick="app.logout()" class="w-8 h-8 sm:w-9 sm:h-9 rounded-full bg-red-50 dark:bg-red-900/30 hover:bg-red-100 text-red-600 dark:text-red-400 flex items-center justify-center border border-red-200/60 dark:border-red-800/40 transition-all" title="Logout">
+                    <button onclick="app.logout()"
+                        class="w-8 h-8 sm:w-9 sm:h-9 rounded-full bg-red-50 dark:bg-red-900/30 hover:bg-red-100 text-red-600 dark:text-red-400 flex items-center justify-center border border-red-200/60 dark:border-red-800/40 transition-all"
+                        title="Logout">
                         <i class="fa-solid fa-right-from-bracket text-xs sm:text-sm"></i>
                     </button>
                 </div>
@@ -610,24 +640,30 @@
         </div>
 
         <!-- Mobile Bottom Quick Navigation Bar (Shown only on small screens) -->
-        <nav class="lg:hidden fixed bottom-0 left-0 right-0 z-30 bg-white/95 dark:bg-slate-900/95 backdrop-blur border-t border-slate-200 dark:border-slate-800 py-1.5 px-3 flex items-center justify-around shadow-lg">
-            <button onclick="app.navigate('dashboard')" class="flex flex-col items-center gap-1 text-slate-500 dark:text-slate-400 hover:text-violet-600 focus:text-violet-600 py-1 px-2">
+        <nav
+            class="lg:hidden fixed bottom-0 left-0 right-0 z-30 bg-white/95 dark:bg-slate-900/95 backdrop-blur border-t border-slate-200 dark:border-slate-800 py-1.5 px-3 flex items-center justify-around shadow-lg">
+            <button onclick="app.navigate('dashboard')"
+                class="flex flex-col items-center gap-1 text-slate-500 dark:text-slate-400 hover:text-violet-600 focus:text-violet-600 py-1 px-2">
                 <i class="fa-solid fa-chart-pie text-lg"></i>
                 <span class="text-[10px] font-bold">Home</span>
             </button>
-            <button onclick="app.navigate('pos')" class="flex flex-col items-center gap-1 -mt-5 bg-gradient-to-tr from-violet-600 to-indigo-600 text-white p-3 rounded-2xl shadow-lg shadow-violet-500/30 active:scale-95 transition-all">
+            <button onclick="app.navigate('pos')"
+                class="flex flex-col items-center gap-1 -mt-5 bg-gradient-to-tr from-violet-600 to-indigo-600 text-white p-3 rounded-2xl shadow-lg shadow-violet-500/30 active:scale-95 transition-all">
                 <i class="fa-solid fa-cash-register text-lg"></i>
                 <span class="text-[10px] font-black uppercase">POS</span>
             </button>
-            <button onclick="app.navigate('products')" class="flex flex-col items-center gap-1 text-slate-500 dark:text-slate-400 hover:text-violet-600 focus:text-violet-600 py-1 px-2">
+            <button onclick="app.navigate('products')"
+                class="flex flex-col items-center gap-1 text-slate-500 dark:text-slate-400 hover:text-violet-600 focus:text-violet-600 py-1 px-2">
                 <i class="fa-solid fa-boxes-stacked text-lg"></i>
                 <span class="text-[10px] font-bold">Items</span>
             </button>
-            <button onclick="app.navigate('repairs')" class="flex flex-col items-center gap-1 text-slate-500 dark:text-slate-400 hover:text-violet-600 focus:text-violet-600 py-1 px-2">
+            <button onclick="app.navigate('repairs')"
+                class="flex flex-col items-center gap-1 text-slate-500 dark:text-slate-400 hover:text-violet-600 focus:text-violet-600 py-1 px-2">
                 <i class="fa-solid fa-screwdriver-wrench text-lg"></i>
                 <span class="text-[10px] font-bold">Repairs</span>
             </button>
-            <button onclick="app.toggleSidebar(true)" class="flex flex-col items-center gap-1 text-slate-500 dark:text-slate-400 hover:text-violet-600 focus:text-violet-600 py-1 px-2">
+            <button onclick="app.toggleSidebar(true)"
+                class="flex flex-col items-center gap-1 text-slate-500 dark:text-slate-400 hover:text-violet-600 focus:text-violet-600 py-1 px-2">
                 <i class="fa-solid fa-ellipsis text-lg"></i>
                 <span class="text-[10px] font-bold">More</span>
             </button>
@@ -641,7 +677,8 @@
             <span class="text-sm font-bold text-slate-800 dark:text-white flex items-center gap-2">
                 <i class="fa-solid fa-camera text-violet-600"></i> Barcode Scanner
             </span>
-            <button onclick="hideCamera()" class="w-7 h-7 rounded-full bg-slate-100 dark:bg-slate-700 text-slate-500 hover:text-red-500 flex items-center justify-center">
+            <button onclick="hideCamera()"
+                class="w-7 h-7 rounded-full bg-slate-100 dark:bg-slate-700 text-slate-500 hover:text-red-500 flex items-center justify-center">
                 <i class="fa-solid fa-xmark text-sm"></i>
             </button>
         </div>
@@ -659,6 +696,9 @@
 
     <!-- Scripts -->
     <script src="app.js"></script>
+    <script
+        src="[https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2](https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2)"></script>
+    <script>const supabase = supabase.createClient('https://dzuycbqcltmlrktiszby.supabase.co/rest/v1/', 'sb_publishable_t89DAWTsAEzM5VrdUfdMlg_WPuvUTx6');</script>
 </body>
 
 </html>
